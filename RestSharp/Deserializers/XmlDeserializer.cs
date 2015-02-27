@@ -17,448 +17,486 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
-using System.Xml.Linq;
-
-using RestSharp.Extensions;
-using System.Globalization;
 using System.Xml;
-using System.ComponentModel;
+using System.Xml.Linq;
+using RestSharp.Extensions;
 
 namespace RestSharp.Deserializers
 {
-	public class XmlDeserializer : IDeserializer
-	{
-		public string RootElement { get; set; }
-		public string Namespace { get; set; }
-		public string DateFormat { get; set; }
-		public CultureInfo Culture { get; set; }
+    public class XmlDeserializer : IDeserializer
+    {
+        public string RootElement { get; set; }
 
-		public XmlDeserializer()
-		{
-			Culture = CultureInfo.InvariantCulture;
-		}
+        public string Namespace { get; set; }
 
-		public virtual T Deserialize<T>(IRestResponse response)
-		{
-			if (string.IsNullOrEmpty( response.Content ))
-				return default(T);
+        public string DateFormat { get; set; }
 
-			var doc = XDocument.Parse(response.Content);
-			var root = doc.Root;
-			if (RootElement.HasValue() && doc.Root != null)
-			{
-				root = doc.Root.Element(RootElement.AsNamespaced(Namespace));
-			}
+        public CultureInfo Culture { get; set; }
 
-			// autodetect xml namespace
-			if (!Namespace.HasValue())
-			{
-				RemoveNamespace(doc);
-			}
+        public XmlDeserializer()
+        {
+            Culture = CultureInfo.InvariantCulture;
+        }
 
-			var x = Activator.CreateInstance<T>();
-			var objType = x.GetType();
+        public virtual T Deserialize<T>(IRestResponse response)
+        {
+            if (string.IsNullOrEmpty(response.Content))
+                return default(T);
 
-			if (objType.IsSubclassOfRawGeneric(typeof(List<>)))
-			{
-				x = (T)HandleListDerivative(x, root, objType.Name, objType);
-			}
-			else
-			{
-				Map(x, root);
-			}
+            var doc = XDocument.Parse(response.Content);
+            var root = doc.Root;
 
-			return x;
-		}
+            if (RootElement.HasValue() && doc.Root != null)
+            {
+                root = doc.Root.Element(RootElement.AsNamespaced(Namespace));
+            }
 
-		private void RemoveNamespace(XDocument xdoc)
-		{
-			foreach (XElement e in xdoc.Root.DescendantsAndSelf())
-			{
-				if (e.Name.Namespace != XNamespace.None)
-				{
-					e.Name = XNamespace.None.GetName(e.Name.LocalName);
-				}
-				if (e.Attributes().Any(a => a.IsNamespaceDeclaration || a.Name.Namespace != XNamespace.None))
-				{
-					e.ReplaceAttributes(e.Attributes().Select(a => a.IsNamespaceDeclaration ? null : a.Name.Namespace != XNamespace.None ? new XAttribute(XNamespace.None.GetName(a.Name.LocalName), a.Value) : a));
-				}
-			}
-		}
+            // autodetect xml namespace
+            if (!Namespace.HasValue())
+            {
+                RemoveNamespace(doc);
+            }
 
-		protected virtual void Map(object x, XElement root)
-		{
-			var objType = x.GetType();
-			var props = objType.GetProperties();
+            var x = Activator.CreateInstance<T>();
+            var objType = x.GetType();
 
-			foreach (var prop in props)
-			{
-				var type = prop.PropertyType;
+            if (objType.IsSubclassOfRawGeneric(typeof(List<>)))
+            {
+                x = (T)HandleListDerivative(x, root, objType.Name, objType);
+            }
+            else
+            {
+                x = (T)Map(x, root);
+            }
 
-				if (!type.IsPublic || !prop.CanWrite)
-					continue;
+            return x;
+        }
 
-				var name = prop.Name.AsNamespaced(Namespace);
-				var value = GetValueFromXml(root, name, prop);
+        private void RemoveNamespace(XDocument xdoc)
+        {
+            foreach (XElement e in xdoc.Root.DescendantsAndSelf())
+            {
+                if (e.Name.Namespace != XNamespace.None)
+                {
+                    e.Name = XNamespace.None.GetName(e.Name.LocalName);
+                }
 
-				if (value == null)
-				{
-					// special case for inline list items
-					if (type.IsGenericType)
-					{
-						var genericType = type.GetGenericArguments()[0];
-						var first = GetElementByName(root, genericType.Name);
-						var list = (IList)Activator.CreateInstance(type);
+                if (e.Attributes().Any(a => a.IsNamespaceDeclaration || a.Name.Namespace != XNamespace.None))
+                {
+                    e.ReplaceAttributes(
+                        e.Attributes()
+                            .Select(
+                                a =>
+                                    a.IsNamespaceDeclaration
+                                        ? null
+                                        : a.Name.Namespace != XNamespace.None
+                                            ? new XAttribute(XNamespace.None.GetName(a.Name.LocalName), a.Value)
+                                            : a));
+                }
+            }
+        }
 
-						if (first != null)
-						{
-							var elements = root.Elements(first.Name);
-							PopulateListFromElements(genericType, elements, list);
-						}
+        protected virtual object Map(object x, XElement root)
+        {
+            var objType = x.GetType();
+            var props = objType.GetProperties();
 
-						prop.SetValue(x, list, null);
-					}
-					continue;
-				}
+            foreach (var prop in props)
+            {
+                var type = prop.PropertyType;
+                var typeIsPublic = type.IsPublic || type.IsNestedPublic;
 
-				// check for nullable and extract underlying type
-				if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>))
-				{
-					// if the value is empty, set the property to null...
-					if (value == null || String.IsNullOrEmpty(value.ToString()))
-					{
-						prop.SetValue(x, null, null);
-						continue;
-					}
-					type = type.GetGenericArguments()[0];
-				}
+                if (!typeIsPublic || !prop.CanWrite)
+                    continue;
 
-				if (type == typeof(bool))
-				{
-					var toConvert = value.ToString().ToLower();
-					prop.SetValue(x, XmlConvert.ToBoolean(toConvert), null);
-				}
-				else if (type.IsPrimitive)
-				{
-					prop.SetValue(x, value.ChangeType(type, Culture), null);
-				}
-				else if (type.IsEnum)
-				{
-					var converted = type.FindEnumValue(value.ToString(), Culture);
-					prop.SetValue(x, converted, null);
-				}
-				else if (type == typeof(Uri))
-				{
-					var uri = new Uri(value.ToString(), UriKind.RelativeOrAbsolute);
-					prop.SetValue(x, uri, null);
-				}
-				else if (type == typeof(string))
-				{
-					prop.SetValue(x, value, null);
-				}
-				else if (type == typeof(DateTime))
-				{
-					if (DateFormat.HasValue())
-					{
-						value = DateTime.ParseExact(value.ToString(), DateFormat, Culture);
-					}
-					else
-					{
-						value = DateTime.Parse(value.ToString(), Culture);
-					}
+                var attributes = prop.GetCustomAttributes(typeof(DeserializeAsAttribute), false);
+                XName name;
 
-					prop.SetValue(x, value, null);
-				}
-				else if (type == typeof(DateTimeOffset))
-				{
-					var toConvert = value.ToString();
-					if (!string.IsNullOrEmpty(toConvert))
-					{
-						DateTimeOffset deserialisedValue;
-						try
-						{
-							deserialisedValue = XmlConvert.ToDateTimeOffset(toConvert);
-							prop.SetValue(x, deserialisedValue, null);
-						}
-						catch (Exception)
-						{
-							object result;
-							if (TryGetFromString(toConvert, out result, type))
-							{
-								prop.SetValue(x, result, null);
-							}
-							else
-							{
-								//fallback to parse
-								deserialisedValue = DateTimeOffset.Parse(toConvert);
-								prop.SetValue(x, deserialisedValue, null);
-							}
-						}
-					}
-				}
-				else if (type == typeof(Decimal))
-				{
-					value = Decimal.Parse(value.ToString(), Culture);
-					prop.SetValue(x, value, null);
-				}
-				else if (type == typeof(Guid))
-				{
-					var raw = value.ToString();
-					value = string.IsNullOrEmpty(raw) ? Guid.Empty : new Guid(value.ToString());
-					prop.SetValue(x, value, null);
-				}
-				else if (type == typeof(TimeSpan))
-				{
-					var timeSpan = XmlConvert.ToTimeSpan(value.ToString());
-					prop.SetValue(x, timeSpan, null);
-				}
-				else if (type.IsGenericType)
-				{
-					var t = type.GetGenericArguments()[0];
-					var list = (IList)Activator.CreateInstance(type);
+                if (attributes.Length > 0)
+                {
+                    var attribute = (DeserializeAsAttribute)attributes[0];
+                    name = attribute.Name.AsNamespaced(Namespace);
+                }
+                else
+                {
+                    name = prop.Name.AsNamespaced(Namespace);
+                }
 
-					var container = GetElementByName(root, prop.Name.AsNamespaced(Namespace));
+                var value = GetValueFromXml(root, name, prop);
 
-					if (container.HasElements)
-					{
-						var first = container.Elements().FirstOrDefault();
-						var elements = container.Elements(first.Name);
-						PopulateListFromElements(t, elements, list);
-					}
+                if (value == null)
+                {
+                    // special case for inline list items
+                    if (type.IsGenericType)
+                    {
+                        var genericType = type.GetGenericArguments()[0];
+                        var first = GetElementByName(root, genericType.Name);
+                        var list = (IList)Activator.CreateInstance(type);
 
-					prop.SetValue(x, list, null);
-				}
-				else if (type.IsSubclassOfRawGeneric(typeof(List<>)))
-				{
-					// handles classes that derive from List<T>
-					// e.g. a collection that also has attributes
-					var list = HandleListDerivative(x, root, prop.Name, type);
-					prop.SetValue(x, list, null);
-				}
-				else
-				{
-					//fallback to type converters if possible
-					object result;
-					if (TryGetFromString(value.ToString(), out result, type))
-					{
-						prop.SetValue(x, result, null);
-					}
-					else
-					{
-						// nested property classes
-						if (root != null)
-						{
-							var element = GetElementByName(root, name);
-							if (element != null)
-							{
-								var item = CreateAndMap(type, element);
-								prop.SetValue(x, item, null);
-							}
-						}
-					}
-				}
-			}
-		}
+                        if (first != null)
+                        {
+                            var elements = root.Elements(first.Name);
+                            PopulateListFromElements(genericType, elements, list);
+                        }
 
-		private static bool TryGetFromString(string inputString, out object result, Type type)
-		{
-#if !SILVERLIGHT && !WINDOWS_PHONE
-			var converter = TypeDescriptor.GetConverter(type);
-			if (converter.CanConvertFrom(typeof(string)))
-			{
-				result = (converter.ConvertFromInvariantString(inputString));
-				return true;
-			}
-			result = null;
-			return false;
-#else
-			result = null;
-			return false;
+                        prop.SetValue(x, list, null);
+                    }
+                    continue;
+                }
+
+                // check for nullable and extract underlying type
+                if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>))
+                {
+                    // if the value is empty, set the property to null...
+                    if (value == null || String.IsNullOrEmpty(value.ToString()))
+                    {
+                        prop.SetValue(x, null, null);
+                        continue;
+                    }
+
+                    type = type.GetGenericArguments()[0];
+                }
+
+                if (type == typeof(bool))
+                {
+                    var toConvert = value.ToString().ToLower();
+                    prop.SetValue(x, XmlConvert.ToBoolean(toConvert), null);
+                }
+                else if (type.IsPrimitive)
+                {
+                    prop.SetValue(x, value.ChangeType(type, Culture), null);
+                }
+                else if (type.IsEnum)
+                {
+                    var converted = type.FindEnumValue(value.ToString(), Culture);
+                    prop.SetValue(x, converted, null);
+                }
+                else if (type == typeof(Uri))
+                {
+                    var uri = new Uri(value.ToString(), UriKind.RelativeOrAbsolute);
+                    prop.SetValue(x, uri, null);
+                }
+                else if (type == typeof(string))
+                {
+                    prop.SetValue(x, value, null);
+                }
+                else if (type == typeof(DateTime))
+                {
+                    if (DateFormat.HasValue())
+                    {
+                        value = DateTime.ParseExact(value.ToString(), DateFormat, Culture);
+                    }
+                    else
+                    {
+                        value = DateTime.Parse(value.ToString(), Culture);
+                    }
+
+                    prop.SetValue(x, value, null);
+                }
+#if !PocketPC
+                else if (type == typeof(DateTimeOffset))
+                {
+                    var toConvert = value.ToString();
+
+                    if (!string.IsNullOrEmpty(toConvert))
+                    {
+                        DateTimeOffset deserialisedValue;
+
+                        try
+                        {
+                            deserialisedValue = XmlConvert.ToDateTimeOffset(toConvert);
+                            prop.SetValue(x, deserialisedValue, null);
+                        }
+                        catch (Exception)
+                        {
+                            object result;
+
+                            if (TryGetFromString(toConvert, out result, type))
+                            {
+                                prop.SetValue(x, result, null);
+                            }
+                            else
+                            {
+                                //fallback to parse
+                                deserialisedValue = DateTimeOffset.Parse(toConvert);
+                                prop.SetValue(x, deserialisedValue, null);
+                            }
+                        }
+                    }
+                }
 #endif
-		}
+                else if (type == typeof(Decimal))
+                {
+                    value = Decimal.Parse(value.ToString(), Culture);
+                    prop.SetValue(x, value, null);
+                }
+                else if (type == typeof(Guid))
+                {
+                    var raw = value.ToString();
+                    value = string.IsNullOrEmpty(raw) ? Guid.Empty : new Guid(value.ToString());
+                    prop.SetValue(x, value, null);
+                }
+                else if (type == typeof(TimeSpan))
+                {
+                    var timeSpan = XmlConvert.ToTimeSpan(value.ToString());
+                    prop.SetValue(x, timeSpan, null);
+                }
+                else if (type.IsGenericType)
+                {
+                    var t = type.GetGenericArguments()[0];
+                    var list = (IList)Activator.CreateInstance(type);
+                    var container = GetElementByName(root, prop.Name.AsNamespaced(Namespace));
 
-		private void PopulateListFromElements(Type t, IEnumerable<XElement> elements, IList list)
-		{
-			foreach (var element in elements)
-			{
-				var item = CreateAndMap(t, element);
-				list.Add(item);
-			}
-		}
+                    if (container.HasElements)
+                    {
+                        var first = container.Elements().FirstOrDefault();
+                        var elements = container.Elements(first.Name);
 
-		private object HandleListDerivative(object x, XElement root, string propName, Type type)
-		{
-			Type t;
+                        PopulateListFromElements(t, elements, list);
+                    }
 
-			if (type.IsGenericType)
-			{
-				t = type.GetGenericArguments()[0];
-			}
-			else
-			{
-				t = type.BaseType.GetGenericArguments()[0];
-			}
+                    prop.SetValue(x, list, null);
+                }
+                else if (type.IsSubclassOfRawGeneric(typeof(List<>)))
+                {
+                    // handles classes that derive from List<T>
+                    // e.g. a collection that also has attributes
+                    var list = HandleListDerivative(x, root, prop.Name, type);
+                    prop.SetValue(x, list, null);
+                }
+                else
+                {
+                    //fallback to type converters if possible
+                    object result;
 
+                    if (TryGetFromString(value.ToString(), out result, type))
+                    {
+                        prop.SetValue(x, result, null);
+                    }
+                    else
+                    {
+                        // nested property classes
+                        if (root != null)
+                        {
+                            var element = GetElementByName(root, name);
 
-			var list = (IList)Activator.CreateInstance(type);
+                            if (element != null)
+                            {
+                                var item = CreateAndMap(type, element);
+                                prop.SetValue(x, item, null);
+                            }
+                        }
+                    }
+                }
+            }
 
-			var elements = root.Descendants(t.Name.AsNamespaced(Namespace));
-			
-			var name = t.Name;
+            return x;
+        }
 
-			if (!elements.Any())
-			{
-				var lowerName = name.ToLower().AsNamespaced(Namespace);
-				elements = root.Descendants(lowerName);
-			}
+        private static bool TryGetFromString(string inputString, out object result, Type type)
+        {
+#if !SILVERLIGHT && !WINDOWS_PHONE && !PocketPC
+            var converter = TypeDescriptor.GetConverter(type);
 
-			if (!elements.Any())
-			{
-				var camelName = name.ToCamelCase(Culture).AsNamespaced(Namespace);
-				elements = root.Descendants(camelName);
-			}
+            if (converter.CanConvertFrom(typeof(string)))
+            {
+                result = (converter.ConvertFromInvariantString(inputString));
+                return true;
+            }
 
-			if (!elements.Any())
-			{
-				elements = root.Descendants().Where(e => e.Name.LocalName.RemoveUnderscoresAndDashes() == name);
-			}
+            result = null;
+            return false;
+#else
+            result = null;
+            return false;
+#endif
+        }
 
-			if (!elements.Any())
-			{
-				var lowerName = name.ToLower().AsNamespaced(Namespace);
-				elements = root.Descendants().Where(e => e.Name.LocalName.RemoveUnderscoresAndDashes() == lowerName);
-			}
+        private void PopulateListFromElements(Type t, IEnumerable<XElement> elements, IList list)
+        {
+            foreach (var element in elements)
+            {
+                var item = CreateAndMap(t, element);
+                list.Add(item);
+            }
+        }
 
-			PopulateListFromElements(t, elements, list);
+        private object HandleListDerivative(object x, XElement root, string propName, Type type)
+        {
+            Type t;
 
-			// get properties too, not just list items
-			// only if this isn't a generic type
-			if (!type.IsGenericType)
-			{
-				Map(list, root.Element(propName.AsNamespaced(Namespace)) ?? root); // when using RootElement, the heirarchy is different
-			}
+            if (type.IsGenericType)
+            {
+                t = type.GetGenericArguments()[0];
+            }
+            else
+            {
+                t = type.BaseType.GetGenericArguments()[0];
+            }
 
-			return list;
-		}
+            var list = (IList)Activator.CreateInstance(type);
+            var elements = root.Descendants(t.Name.AsNamespaced(Namespace));
+            var name = t.Name;
 
-		protected virtual object CreateAndMap(Type t, XElement element)
-		{
-			object item;
-			if (t == typeof(String))
-			{
-				item = element.Value;
-			}
-			else if (t.IsPrimitive)
-			{
-				item = element.Value.ChangeType(t, Culture);
-			}
-			else
-			{
-				item = Activator.CreateInstance(t);
-				Map(item, element);
-			}
+            if (!elements.Any())
+            {
+                var lowerName = name.ToLower().AsNamespaced(Namespace);
+                elements = root.Descendants(lowerName);
+            }
 
-			return item;
-		}
+            if (!elements.Any())
+            {
+                var camelName = name.ToCamelCase(Culture).AsNamespaced(Namespace);
+                elements = root.Descendants(camelName);
+            }
 
-		protected virtual object GetValueFromXml(XElement root, XName name, PropertyInfo prop)
-		{
-			object val = null;
+            if (!elements.Any())
+            {
+                elements = root.Descendants().Where(e => e.Name.LocalName.RemoveUnderscoresAndDashes() == name);
+            }
 
-			if (root != null)
-			{
-				var element = GetElementByName(root, name);
-				if (element == null)
-				{
-					var attribute = GetAttributeByName(root, name);
-					if (attribute != null)
-					{
-						val = attribute.Value;
-					}
-				}
-				else
-				{
-					if (!element.IsEmpty || element.HasElements || element.HasAttributes)
-					{
-						val = element.Value;
-					}
-				}
-			}
+            if (!elements.Any())
+            {
+                var lowerName = name.ToLower().AsNamespaced(Namespace);
+                elements = root.Descendants().Where(e => e.Name.LocalName.RemoveUnderscoresAndDashes() == lowerName);
+            }
 
-			return val;
-		}
+            PopulateListFromElements(t, elements, list);
 
-		protected virtual XElement GetElementByName(XElement root, XName name)
-		{
-			var lowerName = name.LocalName.ToLower().AsNamespaced(name.NamespaceName);
-			var camelName = name.LocalName.ToCamelCase(Culture).AsNamespaced(name.NamespaceName);
+            // get properties too, not just list items
+            // only if this isn't a generic type
+            if (!type.IsGenericType)
+            {
+                Map(list, root.Element(propName.AsNamespaced(Namespace)) ?? root); // when using RootElement, the heirarchy is different
+            }
 
-			if (root.Element(name) != null)
-			{
-				return root.Element(name);
-			}
+            return list;
+        }
 
-			if (root.Element(lowerName) != null)
-			{
-				return root.Element(lowerName);
-			}
+        protected virtual object CreateAndMap(Type t, XElement element)
+        {
+            object item;
 
-			if (root.Element(camelName) != null)
-			{
-				return root.Element(camelName);
-			}
+            if (t == typeof(String))
+            {
+                item = element.Value;
+            }
+            else if (t.IsPrimitive)
+            {
+                item = element.Value.ChangeType(t, Culture);
+            }
+            else
+            {
+                item = Activator.CreateInstance(t);
+                Map(item, element);
+            }
 
-			if (name == "Value".AsNamespaced(name.NamespaceName))
-			{
-				return root;
-			}
+            return item;
+        }
 
-			// try looking for element that matches sanitized property name (Order by depth)
-			var element = root.Descendants()
-				.OrderBy(d => d.Ancestors().Count())
-				.FirstOrDefault(d => d.Name.LocalName.RemoveUnderscoresAndDashes() == name.LocalName) 
-				?? root.Descendants()
-				.OrderBy(d => d.Ancestors().Count())
-				.FirstOrDefault(d => d.Name.LocalName.RemoveUnderscoresAndDashes() == name.LocalName.ToLower());
+        protected virtual object GetValueFromXml(XElement root, XName name, PropertyInfo prop)
+        {
+            object val = null;
 
-			if (element != null)
-			{
-				return element;
-			}
+            if (root != null)
+            {
+                var element = GetElementByName(root, name);
 
-			return null;
-		}
+                if (element == null)
+                {
+                    var attribute = GetAttributeByName(root, name);
 
-		protected virtual XAttribute GetAttributeByName(XElement root, XName name)
-		{
-			var lowerName = name.LocalName.ToLower().AsNamespaced(name.NamespaceName);
-			var camelName = name.LocalName.ToCamelCase(Culture).AsNamespaced(name.NamespaceName);
+                    if (attribute != null)
+                    {
+                        val = attribute.Value;
+                    }
+                }
+                else
+                {
+                    if (!element.IsEmpty || element.HasElements || element.HasAttributes)
+                    {
+                        val = element.Value;
+                    }
+                }
+            }
 
-			if (root.Attribute(name) != null)
-			{
-				return root.Attribute(name);
-			}
+            return val;
+        }
 
-			if (root.Attribute(lowerName) != null)
-			{
-				return root.Attribute(lowerName);
-			}
+        protected virtual XElement GetElementByName(XElement root, XName name)
+        {
+            var lowerName = name.LocalName.ToLower().AsNamespaced(name.NamespaceName);
+            var camelName = name.LocalName.ToCamelCase(Culture).AsNamespaced(name.NamespaceName);
 
-			if (root.Attribute(camelName) != null)
-			{
-				return root.Attribute(camelName);
-			}
+            if (root.Element(name) != null)
+            {
+                return root.Element(name);
+            }
 
-			// try looking for element that matches sanitized property name
-			var element = root.Attributes().FirstOrDefault(d => d.Name.LocalName.RemoveUnderscoresAndDashes() == name.LocalName);
-			if (element != null)
-			{
-				return element;
-			}
+            if (root.Element(lowerName) != null)
+            {
+                return root.Element(lowerName);
+            }
 
-			return null;
-		}
-	}
+            if (root.Element(camelName) != null)
+            {
+                return root.Element(camelName);
+            }
+
+            if (name == "Value".AsNamespaced(name.NamespaceName))
+            {
+                return root;
+            }
+
+            // try looking for element that matches sanitized property name (Order by depth)
+            var element =
+                root.Descendants()
+                    .OrderBy(d => d.Ancestors().Count())
+                    .FirstOrDefault(d => d.Name.LocalName.RemoveUnderscoresAndDashes() == name.LocalName) ?? root.Descendants()
+                    .OrderBy(d => d.Ancestors().Count())
+                    .FirstOrDefault(d => d.Name.LocalName.RemoveUnderscoresAndDashes() == name.LocalName.ToLower());
+
+            if (element != null)
+            {
+                return element;
+            }
+
+            return null;
+        }
+
+        protected virtual XAttribute GetAttributeByName(XElement root, XName name)
+        {
+            var lowerName = name.LocalName.ToLower().AsNamespaced(name.NamespaceName);
+            var camelName = name.LocalName.ToCamelCase(Culture).AsNamespaced(name.NamespaceName);
+
+            if (root.Attribute(name) != null)
+            {
+                return root.Attribute(name);
+            }
+
+            if (root.Attribute(lowerName) != null)
+            {
+                return root.Attribute(lowerName);
+            }
+
+            if (root.Attribute(camelName) != null)
+            {
+                return root.Attribute(camelName);
+            }
+
+            // try looking for element that matches sanitized property name
+            var element = root.Attributes().FirstOrDefault(d => d.Name.LocalName.RemoveUnderscoresAndDashes() == name.LocalName);
+
+            if (element != null)
+            {
+                return element;
+            }
+
+            return null;
+        }
+    }
 }

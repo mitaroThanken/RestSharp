@@ -46,4 +46,4 @@ copy RestSharp.WindowsPhone\bin\Release\RestSharp.WindowsPhone.xml Download\Pack
 
 tools\nuget.exe update -self
 tools\nuget.exe pack restsharp-computed.nuspec -BasePath Download\Package -Output Download
-rm restsharp-computed.nuspec
+del restsharp-computed.nuspec
